@@ -488,6 +488,7 @@ Ledger::digest(key_type const& key) const -> std::optional<digest_type>
 void
 Ledger::rawErase(SLE::ref sle)
 {
+    recordChange(sle->key(), nullptr);
     if (!stateMap_.delItem(sle->key()))
         logicError("Ledger::rawErase: key not found");
 }
@@ -495,6 +496,7 @@ Ledger::rawErase(SLE::ref sle)
 void
 Ledger::rawErase(uint256 const& key)
 {
+    recordChange(key, nullptr);
     if (!stateMap_.delItem(key))
         logicError("Ledger::rawErase: key not found");
 }
@@ -502,6 +504,7 @@ Ledger::rawErase(uint256 const& key)
 void
 Ledger::rawInsert(SLE::ref sle)
 {
+    recordChange(sle->key(), sle);
     Serializer ss;
     sle->add(ss);
     if (!stateMap_.addGiveItem(
@@ -514,12 +517,28 @@ Ledger::rawInsert(SLE::ref sle)
 void
 Ledger::rawReplace(SLE::ref sle)
 {
+    recordChange(sle->key(), sle);
     Serializer ss;
     sle->add(ss);
     if (!stateMap_.updateGiveItem(
             SHAMapNodeType::TnAccountState, makeShamapitem(sle->key(), ss.slice())))
     {
         logicError("Ledger::rawReplace: key not found");
+    }
+}
+
+void
+Ledger::recordChange(uint256 const& key, SLE::const_pointer const& after) noexcept
+{
+    if (!changes_ || !changeStatus_ || changeStatus_->failed)
+        return;
+    try
+    {
+        changes_->record(key, read(keylet::unchecked(key)), after);
+    }
+    catch (...)
+    {
+        changeStatus_->failed = true;
     }
 }
 

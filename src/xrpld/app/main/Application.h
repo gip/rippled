@@ -58,6 +58,7 @@ class Ledger;
 class LedgerMaster;
 class LedgerCleaner;
 class LedgerReplayer;
+class LedgerExporter;
 class LoadManager;
 class ManifestCache;
 class ValidatorKeys;
@@ -137,6 +138,9 @@ public:
 
     virtual Config&
     config() = 0;
+
+    virtual LedgerExporter*
+    getLedgerExporter() = 0;
 
     virtual std::pair<PublicKey, SecretKey> const&
     nodeIdentity() = 0;

@@ -86,7 +86,21 @@ OpenView::OpenView(OpenView const& rhs)
     , base_{rhs.base_}
     , items_{rhs.items_}
     , hold_{rhs.hold_}
-    , open_{rhs.open_} {};
+    , open_{rhs.open_}
+    , changeStatus_{rhs.changeStatus_}
+{
+    if (changeStatus_ && !changeStatus_->failed)
+    {
+        try
+        {
+            transactionChanges_ = rhs.transactionChanges_;
+        }
+        catch (...)
+        {
+            changeStatus_->failed = true;
+        }
+    }
+}
 
 OpenView::OpenView(OpenLedgerT, ReadView const* base, Rules rules, std::shared_ptr<void const> hold)
     : monotonicResource_{
@@ -128,6 +142,43 @@ OpenView::apply(TxsRawView& to) const
     items_.apply(to);
     for (auto const& item : txs_)
         to.rawTxInsert(item.first, item.second.txn, item.second.meta);
+
+    if (changeStatus_ && !changeStatus_->failed)
+    {
+        if (auto* target = dynamic_cast<OpenView*>(&to))
+        {
+            // Journal records follow the same commit/rollback lifetime as the
+            // speculative batch view. Never record its bulk writes a second time.
+            try
+            {
+                target->transactionChanges_.insert(
+                    target->transactionChanges_.end(),
+                    transactionChanges_.begin(),
+                    transactionChanges_.end());
+            }
+            catch (...)
+            {
+                changeStatus_->failed = true;
+                target->transactionChanges_.clear();
+            }
+        }
+    }
+}
+
+void
+OpenView::recordTransaction(TransactionChanges&& changes) noexcept
+{
+    if (!changeStatus_ || changeStatus_->failed)
+        return;
+    try
+    {
+        transactionChanges_.push_back(std::move(changes));
+    }
+    catch (...)
+    {
+        changeStatus_->failed = true;
+        transactionChanges_.clear();
+    }
 }
 
 //---

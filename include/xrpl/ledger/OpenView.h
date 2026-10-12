@@ -2,6 +2,7 @@
 
 #include <xrpl/basics/ByteUtilities.h>
 #include <xrpl/basics/base_uint.h>
+#include <xrpl/ledger/LedgerChanges.h>
 #include <xrpl/ledger/RawView.h>
 #include <xrpl/ledger/ReadView.h>
 #include <xrpl/ledger/detail/RawStateTable.h>
@@ -105,6 +106,9 @@ private:
 
     bool open_ = true;
 
+    std::shared_ptr<LedgerChangeStatus> changeStatus_;
+    std::vector<TransactionChanges> transactionChanges_;
+
 public:
     OpenView() = delete;
     OpenView&
@@ -164,6 +168,7 @@ public:
     OpenView(BatchViewT, OpenView& base) : OpenView(std::addressof(base))
     {
         baseTxCount_ = base.txCount();
+        changeStatus_ = base.changeStatus_;
     }
 
     /**
@@ -203,6 +208,28 @@ public:
      */
     void
     apply(TxsRawView& to) const;
+
+    void
+    enableChangeCapture(std::shared_ptr<LedgerChangeStatus> status) noexcept
+    {
+        if (!open_)
+            changeStatus_ = std::move(status);
+    }
+
+    [[nodiscard]] std::shared_ptr<LedgerChangeStatus> const&
+    changeStatus() const noexcept
+    {
+        return changeStatus_;
+    }
+
+    void
+    recordTransaction(TransactionChanges&& changes) noexcept;
+
+    [[nodiscard]] std::vector<TransactionChanges>
+    takeTransactionChanges() noexcept
+    {
+        return std::move(transactionChanges_);
+    }
 
     // ReadView
 

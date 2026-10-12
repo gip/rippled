@@ -76,6 +76,7 @@
 #include <xrpl/ledger/helpers/DirectoryHelpers.h>
 #include <xrpl/ledger/helpers/MPTokenHelpers.h>
 #include <xrpl/ledger/helpers/TokenHelpers.h>
+#include <xrpl/net/LedgerExporter.h>
 #include <xrpl/protocol/AccountID.h>
 #include <xrpl/protocol/AmountConversions.h>
 #include <xrpl/protocol/ApiVersion.h>
@@ -2818,6 +2819,10 @@ json::Value
 NetworkOPsImp::getServerInfo(bool human, bool admin, bool counters)
 {
     json::Value info = json::ValueType::Object;
+
+    if (admin)
+        if (auto* exporter = registry_.get().getApp().getLedgerExporter())
+            info["ledger_export"] = exporter->getStatus();
 
     // System-level warnings
     {

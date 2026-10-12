@@ -8,10 +8,13 @@
 #include <xrpl/basics/chrono.h>
 #include <xrpl/beast/utility/Journal.h>
 #include <xrpl/beast/utility/instrumentation.h>
+#include <xrpl/core/NetworkIDService.h>
 #include <xrpl/ledger/ApplyView.h>
 #include <xrpl/ledger/CanonicalTXSet.h>
 #include <xrpl/ledger/Ledger.h>
+#include <xrpl/ledger/LedgerChanges.h>
 #include <xrpl/ledger/OpenView.h>
+#include <xrpl/net/LedgerExporter.h>
 #include <xrpl/nodestore/NodeObject.h>
 #include <xrpl/protocol/Indexes.h>  // IWYU pragma: keep
 #include <xrpl/protocol/LedgerHeader.h>
@@ -46,6 +49,21 @@ buildLedgerImpl(
 {
     auto built = std::make_shared<Ledger>(*parent, closeTime);
 
+    auto* exporter = app.getLedgerExporter();
+    std::unique_ptr<LedgerChanges> changes;
+    if (exporter && exporter->enabled())
+    {
+        try
+        {
+            changes = std::make_unique<LedgerChanges>();
+            built->setChangeCapture(&changes->pre, changes->status);
+        }
+        catch (...)
+        {
+            // Report the completed ledger's hash below, without affecting its build.
+        }
+    }
+
     if (built->isFlagLedger())
     {
         built->updateNegativeUNL();
@@ -56,12 +74,20 @@ buildLedgerImpl(
 
     {
         OpenView accum(&*built);
+        if (changes)
+            accum.enableChangeCapture(changes->status);
         XRPL_ASSERT(!accum.open(), "xrpl::buildLedgerImpl : valid ledger state");
         applyTxs(accum, built);
+        built->setChangeCapture(nullptr);
         accum.apply(*built);
+        if (changes)
+            changes->transactions = accum.takeTransactionChanges();
     }
 
+    if (changes)
+        built->setChangeCapture(&changes->post, changes->status);
     built->updateSkipList();
+    built->setChangeCapture(nullptr);
     {
         // Write the final version of all modified SHAMap
         // nodes to the node store to preserve the new LCL
@@ -77,6 +103,32 @@ buildLedgerImpl(
         built->header().seq < kXrpLedgerEarliestFees || built->read(keylet::feeSettings()),
         "xrpl::buildLedgerImpl : valid ledger fees");
     built->setAccepted(closeTime, closeResolution, closeTimeCorrect);
+
+    if (exporter && exporter->enabled())
+    {
+        try
+        {
+            if (!changes || changes->status->failed)
+                throw std::runtime_error("ledger change capture failed");
+            auto const payload =
+                changes->getJson(*parent, *built, app.getNetworkIDService().getNetworkID());
+            exporter->enqueue(built->header().seq, to_string(built->header().hash), payload);
+        }
+        catch (...)
+        {
+            try
+            {
+                exporter->reportGap(
+                    built->header().seq,
+                    to_string(built->header().hash),
+                    "ledger change capture failed");
+            }
+            catch (...)
+            {
+                // Even allocating the diagnostic may fail. Preserve the ledger.
+            }
+        }
+    }
 
     return built;
 }

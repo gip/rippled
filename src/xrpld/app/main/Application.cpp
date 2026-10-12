@@ -71,6 +71,7 @@
 #include <xrpl/ledger/Ledger.h>
 #include <xrpl/ledger/OpenView.h>
 #include <xrpl/ledger/PendingSaves.h>
+#include <xrpl/net/LedgerExporter.h>
 #include <xrpl/nodestore/Database.h>
 #include <xrpl/nodestore/DummyScheduler.h>
 #include <xrpl/nodestore/Manager.h>
@@ -242,6 +243,7 @@ public:
     std::unique_ptr<InboundLedgers> inboundLedgers_;
     std::unique_ptr<InboundTransactions> inboundTransactions_;
     std::unique_ptr<LedgerReplayer> ledgerReplayer_;
+    std::unique_ptr<LedgerExporter> ledgerExporter_;
     TaggedCache<uint256, AcceptedLedger> acceptedLedgerCache_;
     std::unique_ptr<NetworkOPs> networkOPs_;
     std::unique_ptr<Cluster> cluster_;
@@ -496,6 +498,12 @@ public:
 
     bool
     setup(boost::program_options::variables_map const& cmdline) override;
+
+    LedgerExporter*
+    getLedgerExporter() override
+    {
+        return ledgerExporter_.get();
+    }
     void
     start(bool withTimers) override;
     void
@@ -1158,6 +1166,12 @@ private:
 bool
 ApplicationImp::setup(boost::program_options::variables_map const& cmdline)
 {
+    ledgerExporter_ = std::make_unique<LedgerExporter>(
+        config_->section("ledger_export"),
+        config_->legacy(Sections::kDatabasePath),
+        config_->sslVerifyDir,
+        config_->sslVerifyFile,
+        logs_->journal("LedgerExporter"));
     // We want to intercept CTRL-C and the standard termination signal SIGTERM
     // and terminate the process. This handler will NEVER be invoked twice.
     //
@@ -1507,6 +1521,9 @@ ApplicationImp::start(bool withTimers)
 {
     JLOG(journal_.info()) << "Application starting. Version is " << build_info::getVersionString();
 
+    if (ledgerExporter_)
+        ledgerExporter_->start();
+
     if (withTimers)
     {
         setSweepTimer();
@@ -1604,6 +1621,8 @@ ApplicationImp::run()
     loadManager_->stop();
     shaMapStore_->stop();
     jobQueue_->stop();
+    if (ledgerExporter_)
+        ledgerExporter_->stop();
     if (overlay_)
         overlay_->stop();
     grpcServer_->stop();

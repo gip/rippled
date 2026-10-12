@@ -6,6 +6,7 @@
 #include <xrpl/basics/chrono.h>
 #include <xrpl/beast/utility/Journal.h>
 #include <xrpl/ledger/CachedView.h>
+#include <xrpl/ledger/LedgerChanges.h>
 #include <xrpl/ledger/RawView.h>
 #include <xrpl/protocol/Fees.h>
 #include <xrpl/protocol/Keylet.h>
@@ -230,6 +231,17 @@ public:
     void
     rawErase(uint256 const& key);
 
+    // Observe only direct ledger updates outside the transaction accumulator.
+    // The construction owner must detach the recorder before it is destroyed.
+    void
+    setChangeCapture(
+        StateChangeSet* changes,
+        std::shared_ptr<LedgerChangeStatus> status = {}) noexcept
+    {
+        changes_ = changes;
+        changeStatus_ = std::move(status);
+    }
+
     void
     rawReplace(SLE::ref sle) override;
 
@@ -389,6 +401,12 @@ public:
     peek(Keylet const& k) const;
 
 private:
+    StateChangeSet* changes_ = nullptr;
+    std::shared_ptr<LedgerChangeStatus> changeStatus_;
+
+    void
+    recordChange(uint256 const& key, SLE::const_pointer const& after) noexcept;
+
     class SlesIterImpl;
     class TxsIterImpl;
 

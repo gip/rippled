@@ -6,6 +6,7 @@
 #include <xrpl/beast/utility/Journal.h>
 #include <xrpl/beast/utility/instrumentation.h>
 #include <xrpl/json/to_string.h>  // IWYU pragma: keep
+#include <xrpl/ledger/LedgerChanges.h>
 #include <xrpl/ledger/OpenView.h>
 #include <xrpl/ledger/RawView.h>
 #include <xrpl/ledger/ReadView.h>
@@ -117,6 +118,27 @@ ApplyStateTable::apply(
     beast::Journal j)
 {
     // Build metadata and insert
+    std::optional<StateChangeSet> changes;
+    auto const& changeStatus = to.changeStatus();
+    if (!isDryRun && changeStatus && !changeStatus->failed)
+    {
+        changes.emplace(changeStatus);
+        try
+        {
+            // Capture originals before metadata generation threads the mutable
+            // entries to this transaction.
+            for (auto const& [key, item] : items_)
+                if (item.first != Action::Cache)
+                {
+                    auto const before = to.read(keylet::unchecked(key));
+                    changes->record(key, before, nullptr);
+                }
+        }
+        catch (...)
+        {
+            changeStatus->failed = true;
+        }
+    }
     auto const sTx = std::make_shared<Serializer>();
     tx.add(*sTx);
     std::shared_ptr<Serializer> sMeta;
@@ -255,6 +277,25 @@ ApplyStateTable::apply(
             }
         }
 
+        if (changes && !changeStatus->failed)
+        {
+            try
+            {
+                for (auto const& [key, item] : items_)
+                    if (item.first != Action::Cache)
+                        changes->record(
+                            key, nullptr, item.first == Action::Erase ? nullptr : item.second);
+                // These entries were modified only by owner threading and are
+                // absent from the transaction's original modification table.
+                for (auto const& [key, sle] : newMod)
+                    changes->record(key, to.read(keylet::unchecked(key)), sle);
+            }
+            catch (...)
+            {
+                changeStatus->failed = true;
+            }
+        }
+
         if (!isDryRun)
         {
             // add any new modified nodes to the modification set
@@ -276,6 +317,26 @@ ApplyStateTable::apply(
     {
         to.rawTxInsert(tx.getTransactionID(), sTx, sMeta);
         apply(to);
+        if (changes && !changeStatus->failed)
+        {
+            try
+            {
+                to.recordTransaction(
+                    TransactionChanges{
+                        tx.getTransactionID(),
+                        metadata->getIndex(),
+                        ter,
+                        parentBatchId,
+                        tx.getJson(JsonOptions::Values::None),
+                        sTx->modData(),
+                        sMeta->modData(),
+                        std::move(*changes)});
+            }
+            catch (...)
+            {
+                changeStatus->failed = true;
+            }
+        }
     }
     return metadata;
 }

@@ -147,9 +147,11 @@ target_link_libraries(
     xrpl.libxrpl.net
     PUBLIC
         xrpl.libxrpl.basics
+        xrpl.libxrpl.config
         xrpl.libxrpl.json
         xrpl.libxrpl.protocol
         xrpl.libxrpl.resource
+    PRIVATE xrpl.libxrpl.rdb
 )
 
 add_module(xrpl nodestore)
