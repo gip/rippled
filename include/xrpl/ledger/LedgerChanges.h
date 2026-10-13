@@ -64,6 +64,7 @@ struct TransactionChanges
     std::optional<uint256> parentBatchId;
     json::Value transaction;
     Blob transactionData;
+    json::Value metadata;
     Blob metadataData;
     StateChangeSet changes;
 

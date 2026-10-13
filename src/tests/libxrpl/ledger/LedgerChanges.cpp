@@ -120,7 +120,20 @@ protected:
         };
         applyChanges(payload["pre_transaction_changes"]);
         for (auto const& transaction : payload["transactions"])
+        {
+            uint256 hash;
+            ASSERT_TRUE(hash.parseHex(transaction["hash"].asString()));
+            auto const [tx, metadata] = built->txRead(hash);
+            ASSERT_TRUE(tx);
+            ASSERT_TRUE(metadata);
+            EXPECT_EQ(transaction["metadata"], metadata->getJson(JsonOptions::Values::None));
+            Serializer original;
+            metadata->add(original);
+            EXPECT_EQ(transaction["metadata_blob"].asString(), strHex(original.peekData()));
+            EXPECT_EQ(transaction["metadata"]["TransactionIndex"], transaction["TransactionIndex"]);
+            EXPECT_EQ(transaction["metadata"]["TransactionResult"], transaction["result"]);
             applyChanges(transaction["changes"]);
+        }
         applyChanges(payload["post_transaction_changes"]);
         EXPECT_EQ(
             to_string(replay.stateMap().getHash().asUInt256()), payload["state_root"].asString());
@@ -137,6 +150,10 @@ TEST_F(LedgerChangesTest, OrderedTransactionsAndFullEntriesReproduceRoot)
     ASSERT_EQ(payload["transactions"].size(), 2);
     EXPECT_EQ(payload["transactions"][0u]["TransactionIndex"].asUInt(), 0);
     EXPECT_EQ(payload["transactions"][1]["TransactionIndex"].asUInt(), 1);
+    auto const& metadata = payload["transactions"][0u]["metadata"];
+    EXPECT_TRUE(metadata["AffectedNodes"].isArray());
+    EXPECT_GT(metadata["AffectedNodes"].size(), 0);
+    EXPECT_FALSE(metadata.isMember("DeliveredAmount"));
     verifyReplay(payload);
 
     Ledger reference(*parent, now);
@@ -149,6 +166,23 @@ TEST_F(LedgerChangesTest, OrderedTransactionsAndFullEntriesReproduceRoot)
     reference.updateSkipList();
     reference.setAccepted(now, kLedgerGenesisTimeResolution, true);
     EXPECT_EQ(reference.header().hash, built->header().hash);
+}
+
+TEST_F(LedgerChangesTest, MetadataIncludesOptionalDeliveredAmount)
+{
+    ASSERT_EQ(submit(payment(1, alice)).ter, tesSUCCESS);
+    auto const tx = payment(2, bob);
+    STAmount const delivered{XRP(5)};
+    ApplyViewImpl sandbox(view.get(), TapNone);
+    sandbox.deliver(delivered);
+    ASSERT_TRUE(sandbox.apply(*view, *tx, tesSUCCESS, {}, false, registry.getJournal("apply")));
+    auto const payload = finish();
+    ASSERT_EQ(payload["transactions"].size(), 2);
+    EXPECT_FALSE(payload["transactions"][0u]["metadata"].isMember("DeliveredAmount"));
+    EXPECT_EQ(
+        payload["transactions"][1]["metadata"]["DeliveredAmount"],
+        delivered.getJson(JsonOptions::Values::None));
+    verifyReplay(payload);
 }
 
 TEST_F(LedgerChangesTest, FeeClaimAndRejectedAttempt)
@@ -333,9 +367,14 @@ TEST_F(LedgerChangesTest, AllBatchModesFollowCommitAndRollback)
         auto const payload = finish();
         ASSERT_EQ(payload["transactions"].size(), scenario.count);
         for (unsigned i = 1; i < scenario.count; ++i)
+        {
             EXPECT_EQ(
                 payload["transactions"][i]["parent_batch_id"].asString(),
                 to_string(batch->getTransactionID()));
+            EXPECT_EQ(
+                payload["transactions"][i]["metadata"]["ParentBatchID"].asString(),
+                to_string(batch->getTransactionID()));
+        }
         verifyReplay(payload);
     }
 }

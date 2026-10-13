@@ -95,6 +95,7 @@ TransactionChanges::getJson() const
         resultJson["parent_batch_id"] = to_string(*parentBatchId);
     resultJson["transaction"] = transaction;
     resultJson["transaction_blob"] = strHex(transactionData);
+    resultJson["metadata"] = metadata;
     resultJson["metadata_blob"] = strHex(metadataData);
     resultJson["changes"] = changes.getJson();
     return resultJson;

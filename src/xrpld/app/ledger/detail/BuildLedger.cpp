@@ -1,8 +1,10 @@
 #include <xrpld/app/ledger/BuildLedger.h>
 
+#include <xrpld/app/ledger/LedgerMaster.h>
 #include <xrpld/app/ledger/LedgerReplay.h>
 #include <xrpld/app/ledger/OpenLedger.h>
 #include <xrpld/app/main/Application.h>
+#include <xrpld/core/Config.h>
 
 #include <xrpl/basics/Log.h>
 #include <xrpl/basics/chrono.h>
@@ -14,6 +16,7 @@
 #include <xrpl/ledger/Ledger.h>
 #include <xrpl/ledger/LedgerChanges.h>
 #include <xrpl/ledger/OpenView.h>
+#include <xrpl/ledger/View.h>
 #include <xrpl/net/LedgerExporter.h>
 #include <xrpl/nodestore/NodeObject.h>
 #include <xrpl/protocol/Indexes.h>  // IWYU pragma: keep
@@ -21,6 +24,7 @@
 #include <xrpl/protocol/Protocol.h>
 #include <xrpl/protocol/SystemParameters.h>  // IWYU pragma: keep
 #include <xrpl/protocol/TxFlags.h>
+#include <xrpl/server/NetworkOPs.h>
 #include <xrpl/tx/apply.h>
 
 #include <cstddef>
@@ -29,6 +33,27 @@
 #include <set>
 
 namespace xrpl {
+
+namespace {
+
+bool
+canExportLedger(Application& app, Ledger const& parent, beast::Journal j)
+{
+    if (app.config().standalone())
+        return true;
+    auto const validated = app.getLedgerMaster().getValidatedLedger();
+    if (!validated || app.getOPs().isNeedNetworkLedger())
+        return false;
+
+    // Normal startup builds a temporary genesis chain while acquiring the
+    // network ledger. Require a known link to the validated chain before export.
+    auto const& newer = parent.seq() >= validated->seq() ? parent : *validated;
+    auto const& older = parent.seq() >= validated->seq() ? *validated : parent;
+    auto const hash = hashOfSeq(newer, older.seq(), j);
+    return hash && *hash == older.header().hash;
+}
+
+}  // namespace
 
 /* Generic buildLedgerImpl that dispatches to ApplyTxs invocable with signature
     void(OpenView&, std::shared_ptr<Ledger> const&)
@@ -55,8 +80,16 @@ buildLedgerImpl(
     {
         try
         {
-            changes = std::make_unique<LedgerChanges>();
-            built->setChangeCapture(&changes->pre, changes->status);
+            if (canExportLedger(app, *parent, j))
+            {
+                changes = std::make_unique<LedgerChanges>();
+                built->setChangeCapture(&changes->pre, changes->status);
+            }
+            else
+            {
+                JLOG(j.debug()) << "Skipping ledger export before acquiring a validated chain";
+                exporter = nullptr;
+            }
         }
         catch (...)
         {

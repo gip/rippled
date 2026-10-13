@@ -11,7 +11,7 @@
 
 namespace xrpl {
 
-// An optional, application-owned durable outbox with its own HTTP worker.
+// An optional, application-owned export queue with its own HTTP worker.
 class LedgerExporter
 {
     struct Impl;
@@ -40,7 +40,8 @@ public:
     void
     stop() noexcept;
 
-    // Success means the complete payload is durably queued, not delivered.
+    // Success means the complete payload is queued, not delivered.
+    // The queue is durable unless configured with persist=0.
     bool
     enqueue(std::uint32_t ledger, std::string const& hash, json::Value const& payload) noexcept;
 

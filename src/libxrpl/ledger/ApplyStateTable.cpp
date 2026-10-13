@@ -329,6 +329,7 @@ ApplyStateTable::apply(
                         parentBatchId,
                         tx.getJson(JsonOptions::Values::None),
                         sTx->modData(),
+                        metadata->getJson(JsonOptions::Values::None),
                         sMeta->modData(),
                         std::move(*changes)});
             }

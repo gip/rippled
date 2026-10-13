@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -70,6 +71,7 @@ struct LedgerExporter::Impl
     std::string verifyDir_;
     std::string verifyFile_;
     long long maxBytes_;
+    bool persist_;
     beast::Journal journal_;
 
     mutable std::mutex mutex_;
@@ -77,6 +79,11 @@ struct LedgerExporter::Impl
     // Keep recent gaps visible even if the database cannot be written.
     std::map<std::string, std::pair<std::uint32_t, std::string>> volatileGaps_;
     std::unique_ptr<DatabaseCon> db_;
+    std::deque<Pending> pending_;
+    long long pendingBytes_ = 0;
+    std::uint64_t gapCount_ = 0;
+    std::string lastAcknowledgedLedger_;
+    std::string lastAcknowledgedHash_;
     std::optional<HTTPClientSSLContext> ssl_;
     asio::io_context io_;
     asio::steady_timer wake_{io_};
@@ -94,6 +101,7 @@ struct LedgerExporter::Impl
         , verifyDir_(verifyDir)
         , verifyFile_(verifyFile)
         , maxBytes_(config.valueOr<long long>("max_pending_bytes", 1024LL * 1024 * 1024))
+        , persist_(config.valueOr<bool>("persist", true))
         , journal_(journal)
     {
         auto const url = config.valueOr<std::string>("url", "");
@@ -106,7 +114,7 @@ struct LedgerExporter::Impl
             throw std::invalid_argument("Invalid [ledger_export] bearer_token");
         if (maxBytes_ <= 0)
             throw std::invalid_argument("Invalid [ledger_export] max_pending_bytes");
-        if (path_.is_relative())
+        if (persist_ && path_.is_relative())
         {
             if (dataDir.empty())
                 throw std::invalid_argument("[ledger_export] requires a persistent outbox_path");
@@ -132,7 +140,7 @@ struct LedgerExporter::Impl
     void
     openDatabase()
     {
-        if (db_)
+        if (!persist_ || db_)
             return;
         std::filesystem::create_directories(path_.parent_path());
         static std::array<std::string, 4> const kPragmas{
@@ -189,12 +197,16 @@ struct LedgerExporter::Impl
             std::string const message(reason);
             std::lock_guard lock(mutex_);
             lastError_ = message;
+            if (!persist_)
+                ++gapCount_;
             volatileGaps_[hash] = {ledger, message};
             // Status is bounded; durable gap history is retained in SQLite.
             if (volatileGaps_.size() > 100)
                 volatileGaps_.erase(volatileGaps_.begin());
             JLOG(journal_.error())
                 << "Ledger export gap at " << ledger << " " << hash << ": " << message;
+            if (!persist_)
+                return;
             try
             {
                 openDatabase();
@@ -223,26 +235,41 @@ struct LedgerExporter::Impl
     {
         try
         {
-            auto const payload = json::to_string(value);
+            auto payload = json::to_string(value);
             {
                 std::lock_guard lock(mutex_);
-                openDatabase();
-                auto& sql = db_->getSession();
-                soci::transaction transaction(sql);
-                int existing = 0;
-                sql << "SELECT COUNT(*) FROM Outbox WHERE Hash=:h", soci::use(hash),
-                    soci::into(existing);
-                if (existing)
-                    return true;
-                long long pending = 0;
-                sql << "SELECT COALESCE(SUM(Bytes),0) FROM Outbox", soci::into(pending);
-                if (payload.size() > static_cast<std::uint64_t>(maxBytes_) ||
-                    pending > maxBytes_ - static_cast<long long>(payload.size()))
-                    throw std::length_error("outbox capacity exceeded");
-                auto const bytes = static_cast<long long>(payload.size());
-                sql << "INSERT INTO Outbox(Hash,Ledger,Payload,Bytes) VALUES(:h,:l,:p,:b)",
-                    soci::use(hash), soci::use(ledger), soci::use(payload), soci::use(bytes);
-                transaction.commit();
+                if (!persist_)
+                {
+                    if (std::ranges::any_of(
+                            pending_, [&](Pending const& p) { return p.hash == hash; }))
+                        return true;
+                    if (payload.size() > static_cast<std::uint64_t>(maxBytes_) ||
+                        pendingBytes_ > maxBytes_ - static_cast<long long>(payload.size()))
+                        throw std::length_error("outbox capacity exceeded");
+                    auto const bytes = static_cast<long long>(payload.size());
+                    pending_.push_back({0, ledger, hash, std::move(payload)});
+                    pendingBytes_ += bytes;
+                }
+                else
+                {
+                    openDatabase();
+                    auto& sql = db_->getSession();
+                    soci::transaction transaction(sql);
+                    int existing = 0;
+                    sql << "SELECT COUNT(*) FROM Outbox WHERE Hash=:h", soci::use(hash),
+                        soci::into(existing);
+                    if (existing)
+                        return true;
+                    long long pending = 0;
+                    sql << "SELECT COALESCE(SUM(Bytes),0) FROM Outbox", soci::into(pending);
+                    if (payload.size() > static_cast<std::uint64_t>(maxBytes_) ||
+                        pending > maxBytes_ - static_cast<long long>(payload.size()))
+                        throw std::length_error("outbox capacity exceeded");
+                    auto const bytes = static_cast<long long>(payload.size());
+                    sql << "INSERT INTO Outbox(Hash,Ledger,Payload,Bytes) VALUES(:h,:l,:p,:b)",
+                        soci::use(hash), soci::use(ledger), soci::use(payload), soci::use(bytes);
+                    transaction.commit();
+                }
             }
             // Polling also finds queued payloads if notification cannot allocate.
             try
@@ -260,7 +287,7 @@ struct LedgerExporter::Impl
         }
         catch (...)
         {
-            gap(ledger, hash, "outbox persistence failed");
+            gap(ledger, hash, persist_ ? "outbox persistence failed" : "in-memory queue failed");
         }
         return false;
     }
@@ -269,6 +296,12 @@ struct LedgerExporter::Impl
     next()
     {
         std::lock_guard lock(mutex_);
+        if (!persist_)
+        {
+            if (pending_.empty())
+                return std::nullopt;
+            return pending_.front();
+        }
         openDatabase();
         Pending p;
         soci::indicator indicator;
@@ -281,19 +314,37 @@ struct LedgerExporter::Impl
     }
 
     void
+    discardPending()
+    {
+        // Caller holds mutex_; the worker alone removes the oldest payload.
+        pendingBytes_ -= static_cast<long long>(pending_.front().payload.size());
+        pending_.pop_front();
+    }
+
+    void
     acknowledge(Pending const& p)
     {
         std::lock_guard lock(mutex_);
-        auto& sql = db_->getSession();
-        soci::transaction transaction(sql);
-        auto const ledger = std::to_string(p.ledger);
-        sql << "INSERT OR REPLACE INTO ExportState(Name,Value) VALUES('last_acknowledged_hash',:h)",
-            soci::use(p.hash);
-        sql << "INSERT OR REPLACE INTO ExportState(Name,Value) "
-               "VALUES('last_acknowledged_ledger',:l)",
-            soci::use(ledger);
-        sql << "DELETE FROM Outbox WHERE Id=:i", soci::use(p.id);
-        transaction.commit();
+        if (!persist_)
+        {
+            lastAcknowledgedLedger_ = std::to_string(p.ledger);
+            lastAcknowledgedHash_ = p.hash;
+            discardPending();
+        }
+        else
+        {
+            auto& sql = db_->getSession();
+            soci::transaction transaction(sql);
+            auto const ledger = std::to_string(p.ledger);
+            sql << "INSERT OR REPLACE INTO ExportState(Name,Value) "
+                   "VALUES('last_acknowledged_hash',:h)",
+                soci::use(p.hash);
+            sql << "INSERT OR REPLACE INTO ExportState(Name,Value) "
+                   "VALUES('last_acknowledged_ledger',:l)",
+                soci::use(ledger);
+            sql << "DELETE FROM Outbox WHERE Id=:i", soci::use(p.id);
+            transaction.commit();
+        }
         JLOG(journal_.debug()) << "Ledger export acknowledged " << p.ledger << " " << p.hash;
     }
 
@@ -399,18 +450,22 @@ struct LedgerExporter::Impl
     run()
     {
         unsigned delay = 1;
+        unsigned attempts = 0;
         while (!io_.stopped())
         {
             bool failed = false;
+            std::optional<Pending> p;
             try
             {
-                if (auto const p = next())
+                p = next();
+                if (p)
                 {
                     auto const status = co_await post(*p);
                     if (status >= 200 && status < 300)
                     {
                         acknowledge(*p);
                         delay = 1;
+                        attempts = 0;
                         continue;
                     }
                     error("HTTP status " + std::to_string(status));
@@ -421,6 +476,17 @@ struct LedgerExporter::Impl
             {
                 error("delivery or outbox operation failed");
                 failed = true;
+            }
+            if (!persist_ && p && failed && ++attempts == 3)
+            {
+                gap(p->ledger, p->hash, "delivery attempts exhausted");
+                {
+                    std::lock_guard lock(mutex_);
+                    discardPending();
+                }
+                attempts = 0;
+                delay = 1;
+                continue;
             }
             wake_.expires_after(std::chrono::seconds(failed ? delay : 1));
             // New ledgers may wake idle polling, but must not bypass retry delay.
@@ -442,39 +508,56 @@ struct LedgerExporter::Impl
         std::lock_guard lock(mutex_);
         json::Value result{json::ValueType::Object};
         result["enabled"] = true;
+        result["persist"] = persist_;
         result["last_error"] = lastError_;
         auto& gaps = result["gaps"] = json::ValueType::Array;
         std::map<std::string, std::pair<std::uint32_t, std::string>> recent = volatileGaps_;
-        try
-        {
-            if (!db_)
-                throw std::runtime_error("no outbox");
-            auto& sql = db_->getSession();
-            long long count = 0;
-            long long bytes = 0;
-            long long gapCount = 0;
-            sql << "SELECT COUNT(*), COALESCE(SUM(Bytes),0) FROM Outbox", soci::into(count),
-                soci::into(bytes);
-            sql << "SELECT COUNT(*) FROM Gaps", soci::into(gapCount);
-            result["pending_ledgers"] = static_cast<double>(count);
-            result["pending_bytes"] = static_cast<double>(bytes);
-            result["gap_count"] = static_cast<double>(gapCount);
-            soci::rowset<soci::row> rows = (sql.prepare << "SELECT Name,Value FROM ExportState");
-            for (auto const& row : rows)
-                if (auto const name = row.get<std::string>(0);
-                    name != "last_error" || lastError_.empty())
-                    result[name] = row.get<std::string>(1);
-            soci::rowset<soci::row> gapRows =
-                (sql.prepare
-                 << "SELECT Hash,Ledger,Reason FROM Gaps ORDER BY rowid DESC LIMIT 100");
-            for (auto const& row : gapRows)
-                recent[row.get<std::string>(0)] = {
-                    static_cast<std::uint32_t>(row.get<int>(1)), row.get<std::string>(2)};
-            result["storage_available"] = true;
-        }
-        catch (...)
+        if (!persist_)
         {
             result["storage_available"] = false;
+            result["pending_ledgers"] = static_cast<double>(pending_.size());
+            result["pending_bytes"] = static_cast<double>(pendingBytes_);
+            result["gap_count"] = static_cast<double>(gapCount_);
+            if (!lastAcknowledgedHash_.empty())
+            {
+                result["last_acknowledged_ledger"] = lastAcknowledgedLedger_;
+                result["last_acknowledged_hash"] = lastAcknowledgedHash_;
+            }
+        }
+        else
+        {
+            try
+            {
+                if (!db_)
+                    throw std::runtime_error("no outbox");
+                auto& sql = db_->getSession();
+                long long count = 0;
+                long long bytes = 0;
+                long long gapCount = 0;
+                sql << "SELECT COUNT(*), COALESCE(SUM(Bytes),0) FROM Outbox", soci::into(count),
+                    soci::into(bytes);
+                sql << "SELECT COUNT(*) FROM Gaps", soci::into(gapCount);
+                result["pending_ledgers"] = static_cast<double>(count);
+                result["pending_bytes"] = static_cast<double>(bytes);
+                result["gap_count"] = static_cast<double>(gapCount);
+                soci::rowset<soci::row> rows =
+                    (sql.prepare << "SELECT Name,Value FROM ExportState");
+                for (auto const& row : rows)
+                    if (auto const name = row.get<std::string>(0);
+                        name != "last_error" || lastError_.empty())
+                        result[name] = row.get<std::string>(1);
+                soci::rowset<soci::row> gapRows =
+                    (sql.prepare
+                     << "SELECT Hash,Ledger,Reason FROM Gaps ORDER BY rowid DESC LIMIT 100");
+                for (auto const& row : gapRows)
+                    recent[row.get<std::string>(0)] = {
+                        static_cast<std::uint32_t>(row.get<int>(1)), row.get<std::string>(2)};
+                result["storage_available"] = true;
+            }
+            catch (...)
+            {
+                result["storage_available"] = false;
+            }
         }
         unsigned emitted = 0;
         for (auto const& [hash, gap] : recent)

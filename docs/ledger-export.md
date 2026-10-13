@@ -4,10 +4,18 @@ The optional ledger exporter sends a JSON document to an HTTP endpoint for each
 ledger this node builds and accepts locally. It includes transactions in execution
 order and complete state-entry changes. Export is disabled unless a URL is set.
 
+In network mode, export waits until the node has a validated ledger and the
+ledger being built has a known ancestry link to that validated chain. Temporary
+genesis ledgers built during startup or synchronization are skipped. In standalone
+mode, the node's local chain is exported. `ledger_index` always comes from the
+exported ledger's header; it is not a local export counter.
+
 ```ini
 [ledger_export]
 url=https://receiver.example/ledgers
 bearer_token=replace-with-your-token
+# Optional; default is 1. Set to 0 for bounded retries without SQLite storage.
+persist=1
 # Optional; relative paths resolve under database_path.
 outbox_path=ledger_export.sqlite
 # Optional; default is 1 GiB of pending JSON payloads.
@@ -39,8 +47,12 @@ Schema version 1 contains these fields:
 | `post_transaction_changes` | Direct ledger changes after transaction execution |
 
 Each transaction contains `hash`, `TransactionIndex`, `result`, `transaction`
-(JSON), `transaction_blob`, `metadata_blob`, and `changes`. Inner batch transactions
-also contain `parent_batch_id`. Blobs are hex-encoded canonical XRPL serialization.
+(JSON), `transaction_blob`, `metadata` (JSON), `metadata_blob`, and `changes`.
+`metadata` contains the complete readable transaction metadata, including
+`TransactionIndex`, `TransactionResult`, `AffectedNodes`, and optional
+`DeliveredAmount` and `ParentBatchID`. `metadata_blob` preserves the original
+canonical metadata bytes. Inner batch transactions also contain `parent_batch_id`.
+Blobs are hex-encoded canonical XRPL serialization.
 Fee-claiming transactions include only the effects actually committed. Failed
 attempts and rolled-back batch effects are excluded.
 
@@ -81,6 +93,24 @@ source. The exported ledger hash is not a validation proof.
 
 ## Delivery and recovery
 
+With the default `persist=1`, exports use a durable queue and retry indefinitely.
+Set `persist=0` to keep pending exports only in memory: the exporter does not open
+or write a SQLite outbox, including gap records. Each ledger gets **three total
+delivery attempts**, with the same ten-second timeout per attempt and one- and
+two-second delays between attempts. After the third failure (including timeouts,
+transport errors, or non-2xx responses), the payload is dropped, a gap is reported,
+and delivery proceeds to the next queued ledger. This is a per-attempt timeout,
+not an expiry measured from enqueue time; ledgers may wait behind earlier exports.
+
+In this mode, `max_pending_bytes` caps queued JSON bytes in memory, including the
+payload currently being sent. Overflow rejects new exports while retaining older
+ones. Pending exports, acknowledgements, and gap diagnostics are lost on restart;
+dropped exports are not backfilled. Existing SQLite outbox data is left untouched
+and resumes only when `persist=1` is restored. Gap counts cover the current
+process, with up to 100 details kept in memory.
+
+The following durable storage and restart guarantees apply to `persist=1`.
+
 Each complete payload is atomically stored in a dedicated SQLite outbox using
 `synchronous=FULL` before an HTTP attempt. A separate worker sends one pending
 payload at a time in persistent enqueue order, using:
@@ -109,11 +139,13 @@ apply after the outbox commit; a crash before persistence can also leave a gap.
 Capture and serialization add CPU and memory costs, and committing the outbox adds
 storage latency to ledger construction. HTTP waits occur only in the worker.
 
-Admin `server_info` and `server_state` expose `ledger_export`, including `enabled`,
+Admin `server_info` and `server_state` expose `ledger_export`, including `enabled`, `persist`,
 `storage_available`, `pending_ledgers`, `pending_bytes`, `last_acknowledged_ledger`,
 `last_acknowledged_hash`, `last_error`, `gap_count`, and up to 100 gap details.
 Unavailable storage metrics are omitted. Durable gap history remains in the
 outbox database; gaps that cannot be persisted are reported in memory and logs.
+With `persist=0`, pending metrics are available from memory and
+`storage_available` is false because no SQLite storage is used.
 Tokens, response bodies, and endpoint URLs are not logged by the exporter.
 
 To disable export, remove the URL and restart. Retain the outbox if pending data

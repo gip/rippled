@@ -3,6 +3,8 @@
 #include <test/jtx/envconfig.h>
 #include <test/jtx/pay.h>
 
+#include <xrpld/app/ledger/BuildLedger.h>
+#include <xrpld/app/ledger/LedgerMaster.h>
 #include <xrpld/app/main/Application.h>
 #include <xrpld/core/Config.h>
 
@@ -10,14 +12,18 @@
 #include <xrpl/basics/StringUtilities.h>
 #include <xrpl/beast/unit_test/suite.h>
 #include <xrpl/json/json_reader.h>
+#include <xrpl/ledger/CanonicalTXSet.h>
 #include <xrpl/ledger/Ledger.h>
 #include <xrpl/net/LedgerExporter.h>
 #include <xrpl/rdb/SociDB.h>
+#include <xrpl/server/NetworkOPs.h>
 
 #include <soci/soci.h>
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
+#include <set>
 #include <string>
 
 namespace xrpl::test {
@@ -86,6 +92,7 @@ class LedgerExport_test : public beast::unit_test::Suite
         json::Value payload;
         if (!BEAST_EXPECT(reader.parse(raw, payload)))
             return;
+        BEAST_EXPECT(payload["ledger_index"].asUInt() == ledger->header().seq);
         BEAST_EXPECT(payload["ledger_hash"].asString() == to_string(ledger->header().hash));
         BEAST_EXPECT(payload["parent_ledger_hash"].asString() == to_string(parent->header().hash));
         BEAST_EXPECT(payload["transactions"].size() == 1);
@@ -121,12 +128,103 @@ class LedgerExport_test : public beast::unit_test::Suite
         BEAST_EXPECT(replay.stateMap().getHash().asUInt256() == ledger->header().accountHash);
     }
 
+    void
+    testNetworkStartup()
+    {
+        testcase("Network startup waits for a validated chain and preserves ledger sequence");
+        auto const directory =
+            uniqueRandomPath(std::filesystem::temp_directory_path(), "xrpl-ledger-export-");
+        std::filesystem::create_directories(directory);
+        struct Cleanup
+        {
+            std::filesystem::path path;
+            ~Cleanup()
+            {
+                std::error_code ec;
+                std::filesystem::remove_all(path, ec);
+            }
+        } cleanup{directory};
+
+        auto config = jtx::envconfig([&](std::unique_ptr<Config> cfg) {
+            cfg->setupControl(true, true, false);
+            cfg->legacy("database_path", directory.string());
+            cfg->section("peer_private").append("1");
+            auto& section = cfg->section("ledger_export");
+            section.set("url", "http://127.0.0.1:1/ledgers");
+            section.set("outbox_path", (directory / "outbox.sqlite").string());
+            return cfg;
+        });
+        jtx::Env env(*this, std::move(config));
+        auto& app = env.app();
+        auto* exporter = app.getLedgerExporter();
+        if (!BEAST_EXPECT(exporter && exporter->enabled()))
+            return;
+        exporter->stop();
+
+        auto const startupParent = app.getLedgerMaster().getClosedLedger();
+        auto const build = [&](std::shared_ptr<Ledger const> const& parent) {
+            CanonicalTXSet txs(parent->header().hash);
+            std::set<TxID> failed;
+            return buildLedger(
+                parent,
+                parent->header().closeTime + std::chrono::seconds{10},
+                true,
+                parent->header().closeTimeResolution,
+                app,
+                txs,
+                failed,
+                env.journal);
+        };
+        BEAST_EXPECT(!app.getLedgerMaster().getValidatedLedger());
+        auto const startupLedger = build(startupParent);
+        BEAST_EXPECT(startupLedger->seq() == startupParent->seq() + 1);
+        BEAST_EXPECT(exporter->getStatus()["pending_ledgers"].asUInt() == 0);
+        BEAST_EXPECT(exporter->getStatus()["gap_count"].asUInt() == 0);
+
+        // Model acquisition of a network ledger well beyond the genesis chain.
+        auto networkParent =
+            std::make_shared<Ledger>(*startupParent, startupLedger->header().closeTime);
+        auto header = networkParent->header();
+        header.seq = 100000000;
+        networkParent->setLedgerInfo(header);
+        networkParent->updateSkipList();
+        networkParent->setAccepted(header.closeTime, header.closeTimeResolution, true);
+        app.getLedgerMaster().setFullLedger(networkParent, true, false);
+
+        app.getOPs().setNeedNetworkLedger();
+        build(networkParent);
+        BEAST_EXPECT(exporter->getStatus()["pending_ledgers"].asUInt() == 0);
+        app.getOPs().clearNeedNetworkLedger();
+        build(startupParent);
+        BEAST_EXPECT(exporter->getStatus()["pending_ledgers"].asUInt() == 0);
+
+        auto const ledger = build(networkParent);
+        // The next locally built ledger is also eligible before validation catches up.
+        auto const next = build(ledger);
+        BEAST_EXPECT(exporter->getStatus()["pending_ledgers"].asUInt() == 2);
+        BEAST_EXPECT(exporter->getStatus()["gap_count"].asUInt() == 0);
+        soci::session sql;
+        open(sql, "sqlite", (directory / "outbox.sqlite").string());
+        std::uint32_t sequence = 0;
+        std::string raw;
+        sql << "SELECT Ledger,Payload FROM Outbox ORDER BY Id DESC LIMIT 1", soci::into(sequence),
+            soci::into(raw);
+        json::Reader reader;
+        json::Value payload;
+        if (!BEAST_EXPECT(reader.parse(raw, payload)))
+            return;
+        BEAST_EXPECT(sequence == 100000002);
+        BEAST_EXPECT(payload["ledger_index"].asUInt() == next->seq());
+        BEAST_EXPECT(payload["ledger_hash"].asString() == to_string(next->header().hash));
+    }
+
 public:
     void
     run() override
     {
         testClose(false);
         testClose(true);
+        testNetworkStartup();
     }
 };
 

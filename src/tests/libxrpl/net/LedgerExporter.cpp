@@ -81,6 +81,27 @@ class Receiver
     }
 
     asio::awaitable<void>
+    receiveConnection(Tcp::socket socket)
+    {
+        try
+        {
+            if (tls_)
+            {
+                asio::ssl::stream<Tcp::socket&> stream(socket, *tls_);
+                co_await stream.async_handshake(
+                    asio::ssl::stream_base::server, asio::use_awaitable);
+                co_await receive(stream);
+            }
+            else
+                co_await receive(socket);
+        }
+        catch (...)
+        {
+            // Certificate rejection is expected in the TLS tests.
+        }
+    }
+
+    asio::awaitable<void>
     run()
     {
         try
@@ -93,22 +114,7 @@ class Receiver
                     ++connections_;
                     changed_.notify_all();
                 }
-                try
-                {
-                    if (tls_)
-                    {
-                        asio::ssl::stream<Tcp::socket&> stream(socket, *tls_);
-                        co_await stream.async_handshake(
-                            asio::ssl::stream_base::server, asio::use_awaitable);
-                        co_await receive(stream);
-                    }
-                    else
-                        co_await receive(socket);
-                }
-                catch (...)
-                {
-                    // Certificate rejection is expected in the TLS tests.
-                }
+                asio::co_spawn(io_, receiveConnection(std::move(socket)), asio::detached);
             }
         }
         catch (...)
@@ -140,10 +146,10 @@ public:
     }
 
     bool
-    waitFor(std::size_t count)
+    waitFor(std::size_t count, std::chrono::seconds timeout = 8s)
     {
         std::unique_lock lock(mutex_);
-        return changed_.wait_for(lock, 8s, [&] { return requests_.size() >= count; });
+        return changed_.wait_for(lock, timeout, [&] { return requests_.size() >= count; });
     }
 
     bool
@@ -204,7 +210,7 @@ protected:
         do
         {
             auto const status = exporter.getStatus();
-            if (status["storage_available"].asBool() && status["pending_ledgers"].asUInt() == 0)
+            if (status.isMember("pending_ledgers") && status["pending_ledgers"].asUInt() == 0)
                 return true;
             std::this_thread::sleep_for(10ms);
         } while (std::chrono::steady_clock::now() < deadline);
@@ -439,6 +445,177 @@ TEST_F(LedgerExporterTest, RequestTimeoutRetainsPayload)
     ASSERT_TRUE(receiver.waitFor(1));
     EXPECT_TRUE(failed(exporter, 12s));
     EXPECT_EQ(exporter.getStatus()["pending_ledgers"].asUInt(), 1);
+}
+
+TEST_F(LedgerExporterTest, MemoryQueueRetriesAndAcknowledgesWithoutSQLite)
+{
+    Receiver receiver({503, 200, 202});
+    auto section = config(receiver.url());
+    section.set("persist", "0");
+    // Memory-only export needs neither a database directory nor an outbox path.
+    LedgerExporter exporter(section, {}, "", "", journal);
+    ASSERT_TRUE(exporter.enqueue(10, "hash10", payload(10)));
+    ASSERT_TRUE(exporter.enqueue(11, "hash11", payload(11)));
+    ASSERT_TRUE(exporter.enqueue(10, "hash10", payload(10)));
+    EXPECT_EQ(exporter.getStatus()["pending_ledgers"].asUInt(), 2);
+    exporter.start();
+    ASSERT_TRUE(receiver.waitFor(3));
+    ASSERT_TRUE(drained(exporter));
+    auto const requests = receiver.requests();
+    ASSERT_EQ(requests.size(), 3);
+    EXPECT_EQ(requests[0u]["Idempotency-Key"], "hash10");
+    EXPECT_EQ(requests[1]["Idempotency-Key"], "hash10");
+    EXPECT_EQ(requests[2]["Idempotency-Key"], "hash11");
+    auto const status = exporter.getStatus();
+    EXPECT_FALSE(status["persist"].asBool());
+    EXPECT_FALSE(status["storage_available"].asBool());
+    EXPECT_EQ(status["pending_bytes"].asUInt(), 0);
+    EXPECT_EQ(status["gap_count"].asUInt(), 0);
+    EXPECT_EQ(status["last_acknowledged_ledger"].asString(), "11");
+    EXPECT_EQ(status["last_acknowledged_hash"].asString(), "hash11");
+    EXPECT_TRUE(std::filesystem::is_empty(directory));
+}
+
+TEST_F(LedgerExporterTest, MemoryQueueDropsAfterThreeFailuresAndAdvances)
+{
+    Receiver receiver({503, 503, 503, 503, 200});
+    auto section = config(receiver.url());
+    section.set("persist", "0");
+    LedgerExporter exporter(section, directory, "", "", journal);
+    ASSERT_TRUE(exporter.enqueue(10, "hash10", payload(10)));
+    ASSERT_TRUE(exporter.enqueue(11, "hash11", payload(11)));
+    exporter.start();
+    ASSERT_TRUE(receiver.waitFor(5));
+    ASSERT_TRUE(drained(exporter));
+    auto const requests = receiver.requests();
+    ASSERT_EQ(requests.size(), 5);
+    for (unsigned i = 0; i < 3; ++i)
+        EXPECT_EQ(requests[i]["Idempotency-Key"], "hash10");
+    for (unsigned i = 3; i < 5; ++i)
+        EXPECT_EQ(requests[i]["Idempotency-Key"], "hash11");
+    auto const status = exporter.getStatus();
+    EXPECT_EQ(status["pending_bytes"].asUInt(), 0);
+    EXPECT_EQ(status["gap_count"].asUInt(), 1);
+    ASSERT_EQ(status["gaps"].size(), 1);
+    EXPECT_EQ(status["gaps"][0u]["ledger_index"].asUInt(), 10);
+    EXPECT_EQ(status["gaps"][0u]["reason"].asString(), "delivery attempts exhausted");
+    EXPECT_EQ(status["last_acknowledged_hash"].asString(), "hash11");
+    EXPECT_TRUE(std::filesystem::is_empty(directory));
+}
+
+TEST_F(LedgerExporterTest, MemoryQueueDropsAfterConnectionFailures)
+{
+    asio::io_context io;
+    Tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), 0});
+    auto const port = acceptor.local_endpoint().port();
+    acceptor.close();
+    auto section = config("http://127.0.0.1:" + std::to_string(port) + "/ledgers");
+    section.set("persist", "0");
+    LedgerExporter exporter(section, directory, "", "", journal);
+    ASSERT_TRUE(exporter.enqueue(10, "hash10", payload(10)));
+    exporter.start();
+    ASSERT_TRUE(drained(exporter));
+    EXPECT_EQ(exporter.getStatus()["gap_count"].asUInt(), 1);
+    EXPECT_FALSE(exporter.getStatus().isMember("last_acknowledged_hash"));
+    EXPECT_TRUE(std::filesystem::is_empty(directory));
+}
+
+TEST_F(LedgerExporterTest, MemoryQueueDropsAfterThreeTimeouts)
+{
+    Receiver receiver({1, 1, 1, 200});
+    auto section = config(receiver.url());
+    section.set("persist", "0");
+    LedgerExporter exporter(section, directory, "", "", journal);
+    ASSERT_TRUE(exporter.enqueue(10, "hash10", payload(10)));
+    ASSERT_TRUE(exporter.enqueue(11, "hash11", payload(11)));
+    auto const started = std::chrono::steady_clock::now();
+    exporter.start();
+    ASSERT_TRUE(receiver.waitFor(4, 40s));
+    EXPECT_GE(std::chrono::steady_clock::now() - started, 33s);
+    ASSERT_TRUE(drained(exporter));
+    auto const requests = receiver.requests();
+    ASSERT_EQ(requests.size(), 4);
+    for (unsigned i = 0; i < 3; ++i)
+        EXPECT_EQ(requests[i]["Idempotency-Key"], "hash10");
+    EXPECT_EQ(requests[3]["Idempotency-Key"], "hash11");
+    EXPECT_EQ(exporter.getStatus()["gap_count"].asUInt(), 1);
+    EXPECT_EQ(exporter.getStatus()["last_acknowledged_hash"].asString(), "hash11");
+    EXPECT_TRUE(std::filesystem::is_empty(directory));
+}
+
+TEST_F(LedgerExporterTest, MemoryQueueBoundsPayloadsAndDoesNotSurviveRestart)
+{
+    Receiver receiver;
+    auto section = config(receiver.url());
+    section.set("persist", "0");
+    auto const bytes = json::to_string(payload(10)).size();
+    section.set("max_pending_bytes", std::to_string(bytes));
+    {
+        LedgerExporter exporter(section, directory, "", "", journal);
+        ASSERT_TRUE(exporter.enqueue(10, "hash10", payload(10)));
+        ASSERT_TRUE(exporter.enqueue(10, "hash10", payload(10)));
+        EXPECT_FALSE(exporter.enqueue(11, "hash11", payload(11)));
+        auto const status = exporter.getStatus();
+        EXPECT_EQ(status["pending_ledgers"].asUInt(), 1);
+        EXPECT_EQ(status["pending_bytes"].asUInt(), bytes);
+        EXPECT_EQ(status["gap_count"].asUInt(), 1);
+        ASSERT_EQ(status["gaps"].size(), 1);
+        EXPECT_EQ(status["gaps"][0u]["ledger_index"].asUInt(), 11);
+    }
+    LedgerExporter restarted(section, directory, "", "", journal);
+    EXPECT_EQ(restarted.getStatus()["pending_ledgers"].asUInt(), 0);
+    EXPECT_EQ(restarted.getStatus()["gap_count"].asUInt(), 0);
+    ASSERT_TRUE(restarted.enqueue(12, "hash12", payload(12)));
+    restarted.start();
+    ASSERT_TRUE(receiver.waitFor(1));
+    ASSERT_TRUE(drained(restarted));
+    EXPECT_EQ(receiver.requests()[0u]["Idempotency-Key"], "hash12");
+    EXPECT_TRUE(std::filesystem::is_empty(directory));
+}
+
+TEST_F(LedgerExporterTest, MemoryQueueLeavesExistingDurableOutboxUntouched)
+{
+    Receiver receiver;
+    auto section = config(receiver.url());
+    {
+        LedgerExporter exporter(section, directory, "", "", journal);
+        ASSERT_TRUE(exporter.enqueue(10, "hash10", payload(10)));
+        EXPECT_TRUE(exporter.getStatus()["persist"].asBool());
+    }
+    section.set("persist", "0");
+    {
+        LedgerExporter exporter(section, directory, "", "", journal);
+        EXPECT_EQ(exporter.getStatus()["pending_ledgers"].asUInt(), 0);
+        ASSERT_TRUE(exporter.enqueue(11, "hash11", payload(11)));
+        exporter.reportGap(12, "hash12", "test gap");
+        exporter.start();
+        ASSERT_TRUE(receiver.waitFor(1));
+        ASSERT_TRUE(drained(exporter));
+    }
+    section.set("persist", "1");
+    LedgerExporter exporter(section, directory, "", "", journal);
+    EXPECT_EQ(exporter.getStatus()["pending_ledgers"].asUInt(), 1);
+    EXPECT_EQ(exporter.getStatus()["gap_count"].asUInt(), 0);
+    exporter.start();
+    ASSERT_TRUE(receiver.waitFor(2));
+    ASSERT_TRUE(drained(exporter));
+    auto const requests = receiver.requests();
+    ASSERT_EQ(requests.size(), 2);
+    EXPECT_EQ(requests[0u]["Idempotency-Key"], "hash11");
+    EXPECT_EQ(requests[1]["Idempotency-Key"], "hash10");
+}
+
+TEST_F(LedgerExporterTest, MemoryQueueBoundsGapDetailsButRetainsCount)
+{
+    auto section = config("http://127.0.0.1:1/ledgers");
+    section.set("persist", "0");
+    LedgerExporter exporter(section, directory, "", "", journal);
+    for (unsigned i = 0; i < 105; ++i)
+        exporter.reportGap(i, "hash" + std::to_string(i), "test gap");
+    auto const status = exporter.getStatus();
+    EXPECT_EQ(status["gap_count"].asUInt(), 105);
+    EXPECT_EQ(status["gaps"].size(), 100);
+    EXPECT_TRUE(std::filesystem::is_empty(directory));
 }
 
 }  // namespace
